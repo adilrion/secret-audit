@@ -500,18 +500,18 @@ def generate_html_dashboard(report, ai_usage=None):
                 f"<div class='usage-msg'>{esc(u.get('message', 'no data'))}</div></div>"
             )
         bars = ""
-        if u.get("tokens_limit") and u.get("tokens_remaining") is not None:
-            used = u["tokens_limit"] - u["tokens_remaining"]
-            pct = min(100, max(0, round(100 * used / u["tokens_limit"])))
+        if u.get("tokens_limit") is not None and u.get("tokens_remaining") is not None:
+            limit, remaining = u["tokens_limit"], u["tokens_remaining"]
+            pct = 100 if limit == 0 else min(100, max(0, round(100 * (limit - remaining) / limit)))
             color = "#4caf50" if pct < 70 else ("#ff9800" if pct < 90 else "#f44336")
+            reset_txt = f" · resets {esc(u['tokens_reset'])}" if u.get("tokens_reset") else ""
             bars += (
                 f"<div class='bar'><div class='bar-fill' style='width:{pct}%;background:{color}'></div></div>"
-                f"<div class='usage-sub'>Tokens: {u['tokens_remaining']:,} / {u['tokens_limit']:,} remaining ({pct}% used)</div>"
+                f"<div class='usage-sub'>Tokens: {remaining:,} / {limit:,} remaining ({pct}% used){reset_txt}</div>"
             )
-        if u.get("requests_limit") and u.get("requests_remaining") is not None:
-            bars += f"<div class='usage-sub'>Requests: {u['requests_remaining']:,} / {u['requests_limit']:,} remaining</div>"
-        if u.get("reset"):
-            bars += f"<div class='usage-sub'>Resets: {esc(u['reset'])}</div>"
+        if u.get("requests_limit") is not None and u.get("requests_remaining") is not None:
+            reset_txt = f" · resets {esc(u['requests_reset'])}" if u.get("requests_reset") else ""
+            bars += f"<div class='usage-sub'>Requests: {u['requests_remaining']:,} / {u['requests_limit']:,} remaining{reset_txt}</div>"
         if not bars:
             bars = "<div class='usage-msg'>No numeric usage data in response headers</div>"
         return f"<div class='usage-row'><div class='usage-label'>{label}</div>{bars}</div>"
@@ -535,7 +535,8 @@ th {{ background: #f0f0f0; }}
 </style></head><body>
 <h1>🔑 Secret Audit</h1>
 <p>Generated: {esc(report.get('generated_at', ''))}</p>
-<h2>AI Usage (live, fetched when this dashboard was opened)</h2>
+<h2>AI Rate-Limit Headroom (live snapshot, not account spend/billing)</h2>
+<p style="font-size:13px;color:#666;margin-top:-0.5rem;">This is the current per-minute rate-limit window, fetched when this dashboard was opened — it resets constantly and has no relationship to your monthly usage or bill.</p>
 <div class="usage-section">{rows_usage}</div>
 <h2>SSH Keys</h2>
 <table><tr><th>File</th><th>Type</th><th>Fingerprint</th><th>Permissions</th></tr>{rows_ssh}</table>
@@ -797,14 +798,19 @@ def _to_int(v):
         return None
 
 
-def _extract_ratelimit(headers, req_limit_h, req_rem_h, tok_limit_h, tok_rem_h, reset_h):
+def _extract_ratelimit(headers, req_limit_h, req_rem_h, req_reset_h, tok_limit_h, tok_rem_h, tok_reset_h):
     return {
         "requests_limit": _to_int(headers.get(req_limit_h)),
         "requests_remaining": _to_int(headers.get(req_rem_h)),
+        "requests_reset": headers.get(req_reset_h),
         "tokens_limit": _to_int(headers.get(tok_limit_h)),
         "tokens_remaining": _to_int(headers.get(tok_rem_h)),
-        "reset": headers.get(reset_h),
+        "tokens_reset": headers.get(tok_reset_h),
     }
+
+
+def _has_data(data):
+    return any(data[k] is not None for k in ("requests_limit", "requests_remaining", "tokens_limit", "tokens_remaining"))
 
 
 def _post_for_headers(url, headers, body):
@@ -815,7 +821,12 @@ def _post_for_headers(url, headers, body):
     except urllib.error.HTTPError as e:
         if e.code == 401:
             return None, "401 Unauthorized — key invalid/revoked"
-        return e.headers, None
+        # Any other status (400 bad/retired model, 403 no access, 429 actually
+        # rate-limited, ...) might still carry usable rate-limit headers —
+        # keep them, but remember the status so a real misconfiguration isn't
+        # silently reported as the identical "no headers" message a healthy
+        # response with no data would give.
+        return e.headers, f"HTTP {e.code}"
     except Exception as e:
         return None, str(e)
 
@@ -826,62 +837,64 @@ def _check_anthropic_usage(token):
         {"x-api-key": token, "anthropic-version": "2023-06-01", "content-type": "application/json"},
         {"model": "claude-haiku-4-5-20251001", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
     )
-    if err:
+    if headers is None:
         return {"found": False, "message": err}
     data = _extract_ratelimit(
         headers,
-        "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
-        "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining",
-        "anthropic-ratelimit-tokens-reset",
+        "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-requests-reset",
+        "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining", "anthropic-ratelimit-tokens-reset",
     )
     if data["tokens_limit"] is None and data["tokens_remaining"] is None:
-        data.update(_extract_ratelimit(
+        # No unified "tokens" header — some accounts split input/output
+        # instead. Report whichever side is more exhausted, since that's the
+        # one that actually constrains the next call (chat-heavy usage
+        # typically bottlenecks on output, not input).
+        input_data = _extract_ratelimit(
             headers,
-            "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
-            "anthropic-ratelimit-input-tokens-limit", "anthropic-ratelimit-input-tokens-remaining",
-            "anthropic-ratelimit-input-tokens-reset",
-        ))
-    if all(v is None for v in data.values()):
-        return {"found": False, "message": "No rate-limit headers returned by the API"}
+            "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-input-tokens-limit", "anthropic-ratelimit-input-tokens-remaining", "anthropic-ratelimit-input-tokens-reset",
+        )
+        output_data = _extract_ratelimit(
+            headers,
+            "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-output-tokens-limit", "anthropic-ratelimit-output-tokens-remaining", "anthropic-ratelimit-output-tokens-reset",
+        )
+
+        def _frac_remaining(d):
+            return d["tokens_remaining"] / d["tokens_limit"] if d["tokens_limit"] else 1.0
+
+        data.update(output_data if _frac_remaining(output_data) <= _frac_remaining(input_data) else input_data)
+    if not _has_data(data):
+        return {"found": False, "message": err or "No rate-limit headers returned by the API"}
+    return {"found": True, **data}
+
+
+def _check_openai_compatible_usage(url, model, token):
+    # OpenAI and Groq (an OpenAI-compatible API) share the same
+    # x-ratelimit-* header names, so one implementation covers both.
+    headers, err = _post_for_headers(
+        url,
+        {"Authorization": f"Bearer {token}", "content-type": "application/json"},
+        {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    if headers is None:
+        return {"found": False, "message": err}
+    data = _extract_ratelimit(
+        headers,
+        "x-ratelimit-limit-requests", "x-ratelimit-remaining-requests", "x-ratelimit-reset-requests",
+        "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens",
+    )
+    if not _has_data(data):
+        return {"found": False, "message": err or "No rate-limit headers returned by the API"}
     return {"found": True, **data}
 
 
 def _check_openai_usage(token):
-    headers, err = _post_for_headers(
-        "https://api.openai.com/v1/chat/completions",
-        {"Authorization": f"Bearer {token}", "content-type": "application/json"},
-        {"model": "gpt-4o-mini", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
-    )
-    if err:
-        return {"found": False, "message": err}
-    data = _extract_ratelimit(
-        headers,
-        "x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
-        "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
-        "x-ratelimit-reset-tokens",
-    )
-    if all(v is None for v in data.values()):
-        return {"found": False, "message": "No rate-limit headers returned by the API"}
-    return {"found": True, **data}
+    return _check_openai_compatible_usage("https://api.openai.com/v1/chat/completions", "gpt-4o-mini", token)
 
 
 def _check_groq_usage(token):
-    headers, err = _post_for_headers(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {"Authorization": f"Bearer {token}", "content-type": "application/json"},
-        {"model": "llama-3.1-8b-instant", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
-    )
-    if err:
-        return {"found": False, "message": err}
-    data = _extract_ratelimit(
-        headers,
-        "x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
-        "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
-        "x-ratelimit-reset-tokens",
-    )
-    if all(v is None for v in data.values()):
-        return {"found": False, "message": "No rate-limit headers returned by the API"}
-    return {"found": True, **data}
+    return _check_openai_compatible_usage("https://api.groq.com/openai/v1/chat/completions", "llama-3.1-8b-instant", token)
 
 
 AI_USAGE_CHECKERS = {

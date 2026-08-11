@@ -65,6 +65,7 @@ import contextlib
 import io
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import rumps
@@ -79,6 +80,14 @@ try:
 except ImportError:
     NSOpenPanel = None  # pyobjc not available yet — app still works, just shows in the Dock and
                          # loses the native folder picker (Add Folder to Scan won't be available)
+
+try:
+    from PyObjCTools import AppHelper
+except ImportError:
+    AppHelper = None  # menu rebuilds after a background fetch just run inline instead of
+                       # being dispatched back to the main thread — slightly less correct,
+                       # but this only matters on a pyobjc-less install that already lost
+                       # the folder picker above
 
 try:
     import secret_audit  # secret_audit.py must sit next to this file
@@ -101,6 +110,7 @@ except ImportError as e:
 SCAN_DIRS = []
 
 CLIPBOARD_CLEAR_SECONDS = 30
+USAGE_CACHE_TTL_SECONDS = 300  # avoid re-billing a click/dashboard-open that lands seconds apart
 
 
 def _clear_clipboard_if_unchanged(expected_value):
@@ -118,8 +128,12 @@ class SecretAuditMenuBarApp(rumps.App):
     def __init__(self):
         super().__init__("🔑", quit_button="Quit")
         config = secret_audit.load_config()
-        self.scan_dirs = config.get("scan_dirs") or list(SCAN_DIRS)
+        scan_dirs = config.get("scan_dirs")
+        if not (isinstance(scan_dirs, list) and all(isinstance(d, str) for d in scan_dirs)):
+            scan_dirs = None  # malformed/hand-edited config.json — fall back rather than crash later
+        self.scan_dirs = scan_dirs or list(SCAN_DIRS)
         self.report = {}
+        self.usage_cache = {}  # token value -> {"result": ..., "fetched_at": epoch seconds}
         self.menu = ["Run Audit Now"]
         self.refresh(None)
 
@@ -201,15 +215,45 @@ class SecretAuditMenuBarApp(rumps.App):
             ))
         return validity_menu
 
+    @staticmethod
+    def _run_in_background(fn, *args):
+        threading.Thread(target=fn, args=args, daemon=True).start()
+
+    def _safe_rebuild_menu(self):
+        # NSMenu mutation is only really safe from the main thread — this
+        # gets called from background-thread workers, so dispatch back
+        # through AppHelper rather than touching self.menu off-thread.
+        if AppHelper is not None:
+            AppHelper.callAfter(self._rebuild_menu)
+        else:
+            self._rebuild_menu()
+
+    def _unique_ai_tokens(self):
+        # The same real key can show up more than once (e.g. exported in a
+        # shell rc file AND present in os.environ) — dedupe by value so a
+        # single secret doesn't trigger multiple billed usage checks.
+        seen, unique = set(), []
+        for t in self.report.get("tokens", []):
+            if t["name"] in secret_audit.AI_USAGE_CHECKERS and t["value"] not in seen:
+                seen.add(t["value"])
+                unique.append(t)
+        return unique
+
     def open_dashboard(self, _):
-        ai_tokens = [t for t in self.report.get("tokens", []) if t["name"] in secret_audit.AI_USAGE_CHECKERS]
+        ai_tokens = self._unique_ai_tokens()
         if ai_tokens:
             rumps.notification(
-                "Secret Audit", "Fetching live AI usage…",
+                "Secret Audit", "Fetching live rate-limit status…",
                 f"Checking {len(ai_tokens)} key(s) before opening the dashboard",
             )
+        self._run_in_background(self._open_dashboard_worker, ai_tokens)
+
+    def _open_dashboard_worker(self, ai_tokens):
+        # Real, billed, blocking HTTP calls — off the main thread so the
+        # menu bar doesn't freeze for the several seconds this can take
+        # with more than one AI key detected.
         ai_usage = [
-            {"name": t["name"], "masked": t["masked"], **secret_audit.check_ai_usage(t)}
+            {"name": t["name"], "masked": t["masked"], **self._fetch_usage(t, force=False)}
             for t in ai_tokens
         ]
         path = secret_audit.generate_html_dashboard(self.report, ai_usage=ai_usage)
@@ -219,9 +263,16 @@ class SecretAuditMenuBarApp(rumps.App):
                 "Secret Audit", "Couldn't auto-open dashboard",
                 f"Open manually: {path}",
             )
+        # the numbers we just paid for should stick around in the menu too,
+        # not just flash by in the HTML dashboard — rebuild so the inline
+        # bars in _build_token_item pick up what's now in usage_cache.
+        self._safe_rebuild_menu()
 
     def check_validity(self, kind, arg=None):
         rumps.notification("Secret Audit", "Checking…", "Contacting the official API — one moment")
+        self._run_in_background(self._check_validity_worker, kind, arg)
+
+    def _check_validity_worker(self, kind, arg=None):
         if kind == "github":
             r = secret_audit.check_github_token_validity()
             if not r.get("found"):
@@ -273,36 +324,77 @@ class SecretAuditMenuBarApp(rumps.App):
         self.menu.add(rumps.separator)
 
     def _build_token_item(self, t):
-        item = rumps.MenuItem(self._token_label(t))
+        label = self._token_label(t)
+        if t["name"] in secret_audit.AI_USAGE_CHECKERS:
+            cached = self.usage_cache.get(t["value"])
+            if cached:
+                label += "  " + self._usage_bar_text(cached["result"])
+        item = rumps.MenuItem(label)
         item.add(rumps.MenuItem("Copy Token", callback=lambda _, tok=t: self.copy_token(tok)))
         if t["file"] != "environment variable":
             item.add(rumps.MenuItem("Reveal in Finder", callback=lambda _, tok=t: self.reveal_in_finder(tok["file"])))
         if t["name"] in secret_audit.TOKEN_VALIDATORS:
             item.add(rumps.MenuItem("Check Validity", callback=lambda _, tok=t: self.check_token_validity(tok)))
         if t["name"] in secret_audit.AI_USAGE_CHECKERS:
-            item.add(rumps.MenuItem("Check Usage — Realtime (tiny live cost)", callback=lambda _, tok=t: self.check_ai_usage(tok)))
+            item.add(rumps.MenuItem("Check Rate-Limit Status (tiny live cost)", callback=lambda _, tok=t: self.check_ai_usage(tok)))
         return item
 
+    def _fetch_usage(self, token, force=False):
+        # Cached per token value: (1) the bar drawn in the menu (see
+        # _build_token_item) stays visible after the fetch instead of only
+        # flashing in a notification, and (2) a click/dashboard-open that
+        # lands within USAGE_CACHE_TTL_SECONDS of the last one reuses that
+        # result instead of paying for another live call.
+        key = token["value"]
+        cached = self.usage_cache.get(key)
+        if not force and cached and (time.time() - cached["fetched_at"]) < USAGE_CACHE_TTL_SECONDS:
+            return cached["result"]
+        result = secret_audit.check_ai_usage(token)
+        self.usage_cache[key] = {"result": result, "fetched_at": time.time()}
+        return result
+
+    @staticmethod
+    def _usage_bar_text(r):
+        if not r.get("found"):
+            return "[rate limit: n/a]"
+        if r.get("tokens_limit") is not None and r.get("tokens_remaining") is not None:
+            limit, remaining = r["tokens_limit"], r["tokens_remaining"]
+        elif r.get("requests_limit") is not None and r.get("requests_remaining") is not None:
+            limit, remaining = r["requests_limit"], r["requests_remaining"]
+        else:
+            return "[rate limit: n/a]"
+        pct = 100 if limit == 0 else min(100, max(0, round(100 * (limit - remaining) / limit)))
+        filled = round(pct / 10)
+        return f"[{'█' * filled}{'░' * (10 - filled)} {pct}%]"
+
     def check_ai_usage(self, token):
-        rumps.notification("Secret Audit", "Checking usage…", f"Making a minimal live call to the {token['name']} API")
-        r = secret_audit.check_ai_usage(token)
-        rumps.notification("Secret Audit — Realtime Usage", token["name"], self._format_usage(r))
+        rumps.notification("Secret Audit", "Checking rate-limit status…", f"Making a minimal live call to the {token['name']} API")
+        self._run_in_background(self._check_ai_usage_worker, token)
+
+    def _check_ai_usage_worker(self, token):
+        r = self._fetch_usage(token, force=False)
+        rumps.notification("Secret Audit — Rate-Limit Status", token["name"], self._format_usage(r))
+        self._safe_rebuild_menu()
 
     @staticmethod
     def _format_usage(r):
         if not r.get("found"):
             return r.get("message", "No usage data available")
         parts = []
-        if r.get("requests_limit") and r.get("requests_remaining") is not None:
-            parts.append(f"Requests {r['requests_remaining']}/{r['requests_limit']}")
-        if r.get("tokens_limit") and r.get("tokens_remaining") is not None:
-            parts.append(f"Tokens {r['tokens_remaining']}/{r['tokens_limit']}")
-        if r.get("reset"):
-            parts.append(f"resets {r['reset']}")
+        if r.get("requests_limit") is not None and r.get("requests_remaining") is not None:
+            reset = f" (resets {r['requests_reset']})" if r.get("requests_reset") else ""
+            parts.append(f"Requests {r['requests_remaining']}/{r['requests_limit']}{reset}")
+        if r.get("tokens_limit") is not None and r.get("tokens_remaining") is not None:
+            reset = f" (resets {r['tokens_reset']})" if r.get("tokens_reset") else ""
+            parts.append(f"Tokens {r['tokens_remaining']}/{r['tokens_limit']}{reset}")
         return " · ".join(parts) if parts else "Rate-limit headers present but empty"
 
     def check_token_validity(self, token):
         rumps.notification("Secret Audit", "Checking…", f"Contacting the {token['name']} API")
+        self._run_in_background(self._check_token_validity_worker, token)
+
+    @staticmethod
+    def _check_token_validity_worker(token):
         r = secret_audit.check_token_validity(token)
         if r.get("valid") is True:
             msg = r.get("message", "Valid")
