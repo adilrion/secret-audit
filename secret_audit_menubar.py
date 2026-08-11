@@ -4,8 +4,10 @@ secret_audit_menubar.py
 
 A macOS menu bar app — click the icon in your menu bar to see a live
 summary of your secret_audit.py scan (SSH keys, credential files, .env
-files, permission warnings), just like clicking the system-info icon
-shows CPU/memory/storage.
+files, permission warnings, and detected API/service tokens — including
+AI providers like OpenAI/Anthropic — with real file:line locations and a
+Copy Token action), just like clicking the system-info icon shows
+CPU/memory/storage.
 
 REQUIRES: secret_audit.py must be in the SAME FOLDER as this file — it's
 imported directly rather than duplicated.
@@ -56,6 +58,7 @@ Then run: launchctl load ~/Library/LaunchAgents/com.local.secretaudit.plist
 import contextlib
 import io
 import subprocess
+import threading
 import webbrowser
 from pathlib import Path
 
@@ -88,6 +91,19 @@ except ImportError as e:
 # SCAN_DIRS = ["~/code", "~/projects"]
 SCAN_DIRS = []
 
+CLIPBOARD_CLEAR_SECONDS = 30
+
+
+def _clear_clipboard_if_unchanged(expected_value):
+    # Only wipe the clipboard if the user hasn't copied something else in
+    # the meantime — avoids clobbering an unrelated copy.
+    try:
+        current = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return
+    if current == expected_value:
+        subprocess.run(["pbcopy"], input="", text=True)
+
 
 class SecretAuditMenuBarApp(rumps.App):
     def __init__(self):
@@ -109,6 +125,7 @@ class SecretAuditMenuBarApp(rumps.App):
         self._add_section("SSH Keys", self.report.get("ssh_keys", []), self._ssh_line)
         self._add_section("Credential Files", self.report.get("credential_files", []), self._cred_line)
         self._add_section("Project .env Files", self.report.get("project_secret_files", []), self._proj_line)
+        self._add_token_section()
 
         warnings = self._count_warnings()
         self.title = "🔑" if warnings == 0 else f"🔑 {warnings}"
@@ -180,6 +197,42 @@ class SecretAuditMenuBarApp(rumps.App):
         else:
             msg = "Unknown check"
         rumps.notification("Secret Audit — Validity Result", kind, msg)
+
+    def _add_token_section(self):
+        self.menu.add(rumps.MenuItem("— API / Service Tokens —", callback=None))
+        tokens = self.report.get("tokens", [])
+        if not tokens:
+            self.menu.add(rumps.MenuItem("  none found", callback=None))
+        else:
+            for t in tokens:
+                self.menu.add(self._build_token_item(t))
+        self.menu.add(rumps.separator)
+
+    def _build_token_item(self, t):
+        item = rumps.MenuItem(self._token_label(t))
+        item.add(rumps.MenuItem("Copy Token", callback=lambda _, tok=t: self.copy_token(tok)))
+        if t["file"] != "environment variable":
+            item.add(rumps.MenuItem("Reveal in Finder", callback=lambda _, tok=t: self.reveal_in_finder(tok)))
+        return item
+
+    @staticmethod
+    def _token_label(t):
+        loc = "env var" if t["file"] == "environment variable" else Path(t["file"]).name
+        if t.get("line"):
+            loc += f":{t['line']}"
+        tag = " (heuristic)" if t["confidence"] != "high" else ""
+        return f"  {t['name']}{tag} — {t['masked']} — {loc}"
+
+    def copy_token(self, token):
+        subprocess.run(["pbcopy"], input=token["value"], text=True)
+        rumps.notification(
+            "Secret Audit", f"{token['name']} copied",
+            f"Clipboard clears automatically in {CLIPBOARD_CLEAR_SECONDS}s",
+        )
+        threading.Timer(CLIPBOARD_CLEAR_SECONDS, _clear_clipboard_if_unchanged, args=(token["value"],)).start()
+
+    def reveal_in_finder(self, token):
+        subprocess.run(["open", "-R", token["file"]])
 
     def _add_section(self, title, items, line_fn):
         self.menu.add(rumps.MenuItem(f"— {title} —", callback=None))
