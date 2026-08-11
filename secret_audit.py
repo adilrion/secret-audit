@@ -19,10 +19,35 @@ import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
+CONFIG_DIR = HOME / "Library" / "Application Support" / "SecretAudit"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_config():
+    if CONFIG_FILE.is_file():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"scan_dirs": []}
+
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def fix_permissions(path, mode=0o600):
+    try:
+        os.chmod(path, mode)
+        return {"success": True}
+    except OSError as e:
+        return {"success": False, "message": str(e)}
 
 # ---------------------------------------------------------------------------
 # permissions
@@ -629,6 +654,108 @@ def check_ssh_github_validity(key_file):
     if "Permission denied" in text:
         return {"valid": False, "message": "Permission denied — key not registered with GitHub"}
     return {"valid": None, "message": text.strip()[:200] or "no response"}
+
+
+# ---------------------------------------------------------------------------
+# validity checks for detected API/service tokens (read-only endpoints only)
+# ---------------------------------------------------------------------------
+
+def _bearer_check(url, token, header="Authorization", value_fmt="Bearer {}"):
+    req = urllib.request.Request(url, headers={header: value_fmt.format(token)})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read()), None
+    except urllib.error.HTTPError as e:
+        return None, e
+    except Exception as e:
+        return None, e
+
+
+def _check_openai(token):
+    data, err = _bearer_check("https://api.openai.com/v1/models", token)
+    if err is None:
+        return {"valid": True, "message": "Key is active"}
+    if isinstance(err, urllib.error.HTTPError) and err.code == 401:
+        return {"valid": False, "message": "401 Unauthorized — invalid/revoked"}
+    return {"valid": None, "message": str(err)}
+
+
+def _check_anthropic(token):
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models",
+        headers={"x-api-key": token, "anthropic-version": "2023-06-01"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            json.loads(resp.read())
+            return {"valid": True, "message": "Key is active"}
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"valid": False, "message": "401 Unauthorized — invalid/revoked"}
+        return {"valid": None, "message": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"valid": None, "message": str(e)}
+
+
+def _check_google_gemini(token):
+    url = f"https://generativelanguage.googleapis.com/v1/models?key={urllib.parse.quote(token)}"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            json.loads(resp.read())
+            return {"valid": True, "message": "Key is active"}
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401, 403):
+            return {"valid": False, "message": f"HTTP {e.code} — invalid/revoked"}
+        return {"valid": None, "message": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"valid": None, "message": str(e)}
+
+
+def _check_groq(token):
+    data, err = _bearer_check("https://api.groq.com/openai/v1/models", token)
+    if err is None:
+        return {"valid": True, "message": "Key is active"}
+    if isinstance(err, urllib.error.HTTPError) and err.code == 401:
+        return {"valid": False, "message": "401 Unauthorized — invalid/revoked"}
+    return {"valid": None, "message": str(err)}
+
+
+def _check_huggingface(token):
+    data, err = _bearer_check("https://huggingface.co/api/whoami-v2", token)
+    if err is None:
+        return {"valid": True, "message": f"Valid — {data.get('name', '?')}"}
+    if isinstance(err, urllib.error.HTTPError) and err.code == 401:
+        return {"valid": False, "message": "401 Unauthorized — invalid/revoked"}
+    return {"valid": None, "message": str(err)}
+
+
+def _check_replicate(token):
+    data, err = _bearer_check("https://api.replicate.com/v1/account", token, value_fmt="Token {}")
+    if err is None:
+        return {"valid": True, "message": f"Valid — {data.get('username', '?')}"}
+    if isinstance(err, urllib.error.HTTPError) and err.code == 401:
+        return {"valid": False, "message": "401 Unauthorized — invalid/revoked"}
+    return {"valid": None, "message": str(err)}
+
+
+TOKEN_VALIDATORS = {
+    "OpenAI API Key": _check_openai,
+    "Anthropic API Key": _check_anthropic,
+    "Google/Gemini API Key": _check_google_gemini,
+    "Groq API Key": _check_groq,
+    "Hugging Face Token": _check_huggingface,
+    "Replicate Token": _check_replicate,
+}
+
+
+def check_token_validity(token):
+    validator = TOKEN_VALIDATORS.get(token["name"])
+    if not validator:
+        return {"valid": None, "message": "No validity check available for this token type"}
+    try:
+        return validator(token["value"])
+    except Exception as e:
+        return {"valid": None, "message": str(e)}
 
 
 if __name__ == "__main__":
