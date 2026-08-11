@@ -458,7 +458,7 @@ def print_human(report):
         print("  none found")
 
 
-def generate_html_dashboard(report):
+def generate_html_dashboard(report, ai_usage=None):
     def esc(s):
         return html.escape(str(s))
 
@@ -492,6 +492,33 @@ def generate_html_dashboard(report):
 
     rows_tokens = "".join(_token_row(t) for t in report.get("tokens", [])) or "<tr><td colspan=4>none found</td></tr>"
 
+    def _usage_row(u):
+        label = f"{esc(u['name'])} — {esc(u.get('masked', ''))}"
+        if not u.get("found"):
+            return (
+                f"<div class='usage-row'><div class='usage-label'>{label}</div>"
+                f"<div class='usage-msg'>{esc(u.get('message', 'no data'))}</div></div>"
+            )
+        bars = ""
+        if u.get("tokens_limit") and u.get("tokens_remaining") is not None:
+            used = u["tokens_limit"] - u["tokens_remaining"]
+            pct = min(100, max(0, round(100 * used / u["tokens_limit"])))
+            color = "#4caf50" if pct < 70 else ("#ff9800" if pct < 90 else "#f44336")
+            bars += (
+                f"<div class='bar'><div class='bar-fill' style='width:{pct}%;background:{color}'></div></div>"
+                f"<div class='usage-sub'>Tokens: {u['tokens_remaining']:,} / {u['tokens_limit']:,} remaining ({pct}% used)</div>"
+            )
+        if u.get("requests_limit") and u.get("requests_remaining") is not None:
+            bars += f"<div class='usage-sub'>Requests: {u['requests_remaining']:,} / {u['requests_limit']:,} remaining</div>"
+        if u.get("reset"):
+            bars += f"<div class='usage-sub'>Resets: {esc(u['reset'])}</div>"
+        if not bars:
+            bars = "<div class='usage-msg'>No numeric usage data in response headers</div>"
+        return f"<div class='usage-row'><div class='usage-label'>{label}</div>{bars}</div>"
+
+    ai_usage = ai_usage or []
+    rows_usage = "".join(_usage_row(u) for u in ai_usage) or "<div class='usage-msg'>No AI provider tokens with a usage check found</div>"
+
     doc = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Secret Audit</title>
 <style>
@@ -499,9 +526,17 @@ body {{ font-family: -apple-system, sans-serif; margin: 2rem; color: #222; }}
 table {{ border-collapse: collapse; width: 100%; margin-bottom: 2rem; }}
 td, th {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; font-size: 14px; }}
 th {{ background: #f0f0f0; }}
+.usage-row {{ margin-bottom: 1.25rem; }}
+.usage-label {{ font-weight: 600; margin-bottom: 4px; }}
+.bar {{ background: #eee; border-radius: 4px; height: 14px; overflow: hidden; width: 100%; max-width: 480px; }}
+.bar-fill {{ height: 100%; }}
+.usage-sub {{ font-size: 13px; color: #555; margin-top: 2px; }}
+.usage-msg {{ font-size: 13px; color: #888; font-style: italic; }}
 </style></head><body>
 <h1>🔑 Secret Audit</h1>
 <p>Generated: {esc(report.get('generated_at', ''))}</p>
+<h2>AI Usage (live, fetched when this dashboard was opened)</h2>
+<div class="usage-section">{rows_usage}</div>
 <h2>SSH Keys</h2>
 <table><tr><th>File</th><th>Type</th><th>Fingerprint</th><th>Permissions</th></tr>{rows_ssh}</table>
 <h2>Credential Files</h2>
@@ -746,6 +781,124 @@ TOKEN_VALIDATORS = {
     "Hugging Face Token": _check_huggingface,
     "Replicate Token": _check_replicate,
 }
+
+
+# Real-time usage: no provider offers a free "how much have I used" lookup
+# for a plain API key — the numbers only ride along as rate-limit headers on
+# a real, metered request. Each checker below fires the cheapest possible
+# real call (max_tokens=1, cheapest model) purely to read those headers.
+# Only providers with a documented, stable header contract are implemented —
+# guessing at undocumented behavior would just show misleading numbers.
+
+def _to_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_ratelimit(headers, req_limit_h, req_rem_h, tok_limit_h, tok_rem_h, reset_h):
+    return {
+        "requests_limit": _to_int(headers.get(req_limit_h)),
+        "requests_remaining": _to_int(headers.get(req_rem_h)),
+        "tokens_limit": _to_int(headers.get(tok_limit_h)),
+        "tokens_remaining": _to_int(headers.get(tok_rem_h)),
+        "reset": headers.get(reset_h),
+    }
+
+
+def _post_for_headers(url, headers, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.headers, None
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return None, "401 Unauthorized — key invalid/revoked"
+        return e.headers, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _check_anthropic_usage(token):
+    headers, err = _post_for_headers(
+        "https://api.anthropic.com/v1/messages",
+        {"x-api-key": token, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        {"model": "claude-haiku-4-5-20251001", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    if err:
+        return {"found": False, "message": err}
+    data = _extract_ratelimit(
+        headers,
+        "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
+        "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining",
+        "anthropic-ratelimit-tokens-reset",
+    )
+    if data["tokens_limit"] is None and data["tokens_remaining"] is None:
+        data.update(_extract_ratelimit(
+            headers,
+            "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
+            "anthropic-ratelimit-input-tokens-limit", "anthropic-ratelimit-input-tokens-remaining",
+            "anthropic-ratelimit-input-tokens-reset",
+        ))
+    if all(v is None for v in data.values()):
+        return {"found": False, "message": "No rate-limit headers returned by the API"}
+    return {"found": True, **data}
+
+
+def _check_openai_usage(token):
+    headers, err = _post_for_headers(
+        "https://api.openai.com/v1/chat/completions",
+        {"Authorization": f"Bearer {token}", "content-type": "application/json"},
+        {"model": "gpt-4o-mini", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    if err:
+        return {"found": False, "message": err}
+    data = _extract_ratelimit(
+        headers,
+        "x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
+        "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-tokens",
+    )
+    if all(v is None for v in data.values()):
+        return {"found": False, "message": "No rate-limit headers returned by the API"}
+    return {"found": True, **data}
+
+
+def _check_groq_usage(token):
+    headers, err = _post_for_headers(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {"Authorization": f"Bearer {token}", "content-type": "application/json"},
+        {"model": "llama-3.1-8b-instant", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    if err:
+        return {"found": False, "message": err}
+    data = _extract_ratelimit(
+        headers,
+        "x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
+        "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-tokens",
+    )
+    if all(v is None for v in data.values()):
+        return {"found": False, "message": "No rate-limit headers returned by the API"}
+    return {"found": True, **data}
+
+
+AI_USAGE_CHECKERS = {
+    "OpenAI API Key": _check_openai_usage,
+    "Anthropic API Key": _check_anthropic_usage,
+    "Groq API Key": _check_groq_usage,
+}
+
+
+def check_ai_usage(token):
+    checker = AI_USAGE_CHECKERS.get(token["name"])
+    if not checker:
+        return {"found": False, "message": "No usage check available for this provider yet"}
+    try:
+        return checker(token["value"])
+    except Exception as e:
+        return {"found": False, "message": str(e)}
 
 
 def check_token_validity(token):

@@ -202,7 +202,17 @@ class SecretAuditMenuBarApp(rumps.App):
         return validity_menu
 
     def open_dashboard(self, _):
-        path = secret_audit.generate_html_dashboard(self.report)
+        ai_tokens = [t for t in self.report.get("tokens", []) if t["name"] in secret_audit.AI_USAGE_CHECKERS]
+        if ai_tokens:
+            rumps.notification(
+                "Secret Audit", "Fetching live AI usage…",
+                f"Checking {len(ai_tokens)} key(s) before opening the dashboard",
+            )
+        ai_usage = [
+            {"name": t["name"], "masked": t["masked"], **secret_audit.check_ai_usage(t)}
+            for t in ai_tokens
+        ]
+        path = secret_audit.generate_html_dashboard(self.report, ai_usage=ai_usage)
         result = subprocess.run(["open", path], capture_output=True, text=True)
         if result.returncode != 0:
             rumps.notification(
@@ -269,7 +279,27 @@ class SecretAuditMenuBarApp(rumps.App):
             item.add(rumps.MenuItem("Reveal in Finder", callback=lambda _, tok=t: self.reveal_in_finder(tok["file"])))
         if t["name"] in secret_audit.TOKEN_VALIDATORS:
             item.add(rumps.MenuItem("Check Validity", callback=lambda _, tok=t: self.check_token_validity(tok)))
+        if t["name"] in secret_audit.AI_USAGE_CHECKERS:
+            item.add(rumps.MenuItem("Check Usage — Realtime (tiny live cost)", callback=lambda _, tok=t: self.check_ai_usage(tok)))
         return item
+
+    def check_ai_usage(self, token):
+        rumps.notification("Secret Audit", "Checking usage…", f"Making a minimal live call to the {token['name']} API")
+        r = secret_audit.check_ai_usage(token)
+        rumps.notification("Secret Audit — Realtime Usage", token["name"], self._format_usage(r))
+
+    @staticmethod
+    def _format_usage(r):
+        if not r.get("found"):
+            return r.get("message", "No usage data available")
+        parts = []
+        if r.get("requests_limit") and r.get("requests_remaining") is not None:
+            parts.append(f"Requests {r['requests_remaining']}/{r['requests_limit']}")
+        if r.get("tokens_limit") and r.get("tokens_remaining") is not None:
+            parts.append(f"Tokens {r['tokens_remaining']}/{r['tokens_limit']}")
+        if r.get("reset"):
+            parts.append(f"resets {r['reset']}")
+        return " · ".join(parts) if parts else "Rate-limit headers present but empty"
 
     def check_token_validity(self, token):
         rumps.notification("Secret Audit", "Checking…", f"Contacting the {token['name']} API")
